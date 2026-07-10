@@ -2,6 +2,7 @@ import io
 import json
 import os
 import logging
+import random
 import re
 import sys
 import zipfile
@@ -166,67 +167,198 @@ def _extract_text_from_response(data):
     return extracted
 
 
-def generate_with_llama(prompt: str, max_tokens: int = 1000, system_prompt: str = None) -> str:
-    """Generate text using the local Ollama chat API."""
+def generate_with_llama(prompt: str, max_tokens: int = 1000, system_prompt: str = None, response_format=None) -> str:
+    """Generate text using the local Ollama chat API.
+
+    response_format, when given a JSON schema dict, asks Ollama to constrain
+    the model's output to that shape. For models Ollama runs locally this is
+    a hard grammar constraint; for cloud-relayed models it's only as strong
+    as the remote backend's own structured-output support (verified
+    empirically per-model, not guaranteed by the API itself).
+    """
     load_local_env()
 
     model_name = os.getenv("LLAMA_MODEL_NAME", "gemma4:12b")
     if ollama_chat is not None:
-        try:
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-            
-            response = ollama_chat(model=model_name, messages=messages, think=False, stream=False, options={"num_predict": 200})
-            if isinstance(response, collections.abc.Iterator) or isinstance(response, (list, tuple)):
-                response = list(response)
-                response = response[-1] if response else None
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
 
-            content = getattr(getattr(response, "message", None), "content", None)
-            if isinstance(content, str) and content.strip():
-                return content.strip()
+        max_attempts = 5
+        base_delay = 2.0  # seconds
 
-            content = _extract_text_from_response(response)
-            if isinstance(content, str) and content.strip():
-                return content.strip()
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = ollama_chat(
+                    model=model_name,
+                    messages=messages,
+                    think=False,
+                    stream=False,
+                    format=response_format,
+                    options={"num_predict": max_tokens},
+                )
+                if isinstance(response, collections.abc.Iterator) or isinstance(response, (list, tuple)):
+                    response = list(response)
+                    response = response[-1] if response else None
 
-            raise RuntimeError(
-                f"Ollama chat returned no usable response content: {content!r}. "
-                f"Response type: {type(response).__name__}, response repr: {repr(response)}"
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Ollama chat failed: {e}. Install and run the Ollama service locally and ensure the model '{model_name}' is available."
-            )
+                content = getattr(getattr(response, "message", None), "content", None)
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+
+                content = _extract_text_from_response(response)
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+
+                raise RuntimeError(
+                    f"Ollama chat returned no usable response content: {content!r}. "
+                    f"Response type: {type(response).__name__}, response repr: {repr(response)}"
+                )
+            except Exception as e:
+                # Only retry errors that look transient (server overload, 5xx,
+                # timeouts, connection hiccups). A 4xx like "model not found"
+                # will never succeed no matter how many times we retry it.
+                status_code = getattr(e, "status_code", None)
+                transient = status_code is None or status_code >= 500
+
+                if transient and attempt < max_attempts:
+                    delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    log.warning(
+                        f"Ollama chat call failed on attempt {attempt}/{max_attempts} "
+                        f"(status_code={status_code}): {e}. Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+
+                raise RuntimeError(
+                    f"Ollama chat failed after {attempt} attempt(s): {e}. Install and run the Ollama "
+                    f"service locally and ensure the model '{model_name}' is available."
+                )
 
     raise RuntimeError(
         "No Ollama chat client is available. Install the ollama package and ensure the local Ollama service is running."
     )
 
 
-def classify_batch(batch):
-    system_prompt = """You are a domain name threat classifier. You analyze lists of newly registered domains and flag any that appear in these categories:
-- Scams/Phishing (e.g. paypa1-secure.com, amazon-login-verify.net)
-- Typosquatting of well-known brands (e.g. gooogle.com, arnazon.com)
-- Gambling sites (e.g. online-casino.net, bet365-login.com)
-- Malware distribution or potential C2 (e.g. malware-download.com, c2-server.net)
-- Ads (e.g. adsrvs.com, adclicks.net)
-- Tracking or analytics (e.g. trackingpixel.com, analytics-service.net)
-- Cryptojacking (e.g. cryptomining.com, coin-hive.com)
-- AI Deepfake or impersonation (e.g. deepfake-celebrity.com, fake-ai-avatar.net)
+CLASSIFICATION_CATEGORIES = [
+    "Scams/Phishing",
+    "Typosquatting",
+    "Gambling",
+    "Malware/C2",
+    "Ads",
+    "Tracking/Analytics",
+    "Cryptojacking",
+    "AI Deepfake/Impersonation",
+]
 
-Return ONLY the flagged domains, one per line, in csv format. DOMAIN, CATEGORY. (e.g. paypals.com, Scams/Phishing)
-If the domain is not suspicious or does not have a confidence score of 0.9 or higher, do not return the domain."""
+# Requests the model constrain its output to this exact shape, eliminating
+# narration/preamble (see generate_with_llama docstring re: cloud vs local
+# enforcement strength). The category enum also normalizes labels that used
+# to vary ("Gambling" vs "Gambling sites") across responses.
+FLAGGED_DOMAINS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "flagged": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string"},
+                    "category": {"type": "string", "enum": CLASSIFICATION_CATEGORIES},
+                },
+                "required": ["domain", "category"],
+            },
+        }
+    },
+    "required": ["flagged"],
+}
+
+
+def classify_batch(batch):
+    categories_line = ", ".join(CLASSIFICATION_CATEGORIES)
+    system_prompt = (
+        "You are a domain name threat classifier. You analyze lists of newly registered domains and flag any that appear in these categories:\n"
+        "- Scams/Phishing (e.g. paypa1-secure.com, amazon-login-verify.net)\n"
+        "- Typosquatting of well-known brands (e.g. gooogle.com, arnazon.com)\n"
+        "- Gambling sites (e.g. online-casino.net, bet365-login.com)\n"
+        "- Malware distribution or potential C2 (e.g. malware-download.com, c2-server.net)\n"
+        "- Ads (e.g. adsrvs.com, adclicks.net)\n"
+        "- Tracking or analytics (e.g. trackingpixel.com, analytics-service.net)\n"
+        "- Cryptojacking (e.g. cryptomining.com, coin-hive.com)\n"
+        "- AI Deepfake or impersonation (e.g. deepfake-celebrity.com, fake-ai-avatar.net)\n\n"
+        'Respond with JSON matching the given schema: {"flagged": [{"domain": "...", "category": "..."}]}.\n'
+        "Use ONLY these exact category values: " + categories_line + ".\n"
+        "Only include a domain if it has a confidence score of 0.9 or higher for one of the categories above.\n"
+        'If none qualify, respond with {"flagged": []}.\n'
+        "Output compact, minified JSON on a single line with no pretty-printing, indentation, or extra "
+        "whitespace/newlines inside the JSON. Every token spent on formatting is a token not spent on "
+        "another flagged domain."
+    )
 
     user_input = chr(10).join(batch)
-    resp_text = generate_with_llama(user_input, max_tokens=1000, system_prompt=system_prompt)
-    flagged = resp_text.strip().splitlines()
-    return [d.strip().lower() for d in flagged if d.strip()]
+    resp_text = generate_with_llama(
+        user_input,
+        max_tokens=4000,
+        system_prompt=system_prompt,
+        response_format=FLAGGED_DOMAINS_SCHEMA,
+    )
+
+    batch_domains = {d.strip().lower() for d in batch}
+
+    # Some providers wrap structured-output JSON in a markdown code fence
+    # even when a schema was requested -- strip it before parsing.
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", resp_text.strip(), re.DOTALL)
+    json_text = fenced.group(1) if fenced else resp_text
+
+    try:
+        # Parse just the first complete JSON value and ignore anything the
+        # model appended after it (some responses trail off into extra
+        # commentary or a repeated block past the closing brace) rather than
+        # requiring the entire response to be pure JSON via json.loads().
+        parsed, _ = json.JSONDecoder().raw_decode(json_text.lstrip())
+        rows = parsed.get("flagged", []) if isinstance(parsed, dict) else []
+    except json.JSONDecodeError as e:
+        # Usually means the response got cut off mid-array by hitting
+        # max_tokens before the model could close out the JSON.
+        log.warning(
+            "Batch response was not valid JSON despite requesting structured "
+            "output (likely truncated by num_predict): %s. Raw response "
+            "(first 500 chars): %r",
+            e, resp_text[:500],
+        )
+        return []
+
+    flagged = []
+    rejected = 0
+    first_rejected = None
+    for row in rows:
+        domain = str(row.get("domain", "")).strip().lower() if isinstance(row, dict) else ""
+        category = str(row.get("category", "")).strip() if isinstance(row, dict) else ""
+        # Only trust rows naming a domain that was actually in this batch --
+        # anything else is a hallucinated/misremembered domain, not a real
+        # classification of the input we sent.
+        if domain and category and is_valid_domain(domain) and domain in batch_domains:
+            flagged.append(f"{domain},{category}")
+        else:
+            rejected += 1
+            if first_rejected is None:
+                first_rejected = row
+
+    if rows:
+        reject_rate = rejected / len(rows)
+        if rejected >= 5 and reject_rate >= 0.5:
+            log.warning(
+                "Batch response had %d/%d (%.0f%%) entries rejected: not a real "
+                "domain from this batch. First rejected entry: %r",
+                rejected, len(rows), reject_rate * 100, first_rejected,
+            )
+
+    return flagged
 
 
 def classify_domains(domains):
     all_flagged = []
+    zero_flag_batches = 0
     total_batches = (len(domains) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for i in range(0, len(domains), BATCH_SIZE):
@@ -234,9 +366,23 @@ def classify_domains(domains):
         batch_num = i // BATCH_SIZE + 1
         flagged = classify_batch(batch)
         all_flagged.extend(flagged)
+        if not flagged:
+            zero_flag_batches += 1
         log.info(f"Batch {batch_num}/{total_batches}: {len(flagged)} flagged")
 
     log.info(f"Total flagged: {len(all_flagged):,}")
+
+    if total_batches >= 3:
+        zero_flag_rate = zero_flag_batches / total_batches
+        if zero_flag_rate >= 0.8:
+            log.warning(
+                "%d/%d batches (%.0f%%) returned zero flagged domains this run. "
+                "That's unusual for this feed -- treat this as a likely classifier "
+                "failure (truncated responses, bad model config, etc.) rather than "
+                "assuming today's batch was unusually clean, and check the run's logs.",
+                zero_flag_batches, total_batches, zero_flag_rate * 100,
+            )
+
     return all_flagged
 
 
