@@ -761,7 +761,15 @@ def push_to_github():
     except subprocess.CalledProcessError:
         log.info("No changes to commit")
 
-    remote_url = f"https://x-access-token:{token}@github.com/{repo_url}.git"
+    # The remote URL deliberately never embeds the token -- a token-bearing
+    # URL would get written to .git/config in plaintext (and that file is
+    # commonly world-readable), and would also appear verbatim in any
+    # CalledProcessError raised against a command referencing it. Credentials
+    # are instead supplied only to the `push` invocation below, via a
+    # transient credential helper that reads GITHUB_TOKEN from the process
+    # environment at git's invocation time -- the secret itself never touches
+    # disk or any command's argv.
+    remote_url = f"https://github.com/{repo_url}.git"
     # set remote if not present
     try:
         subprocess.run(["git", "-C", str(repo_dir), "remote", "add", "origin", remote_url], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -773,9 +781,21 @@ def push_to_github():
             log.warning("Unable to configure Git remote origin: %s", exc)
             return None
 
+    credential_helper = '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+    push_env = os.environ.copy()
+    push_env["GITHUB_TOKEN"] = token
     try:
-        subprocess.run(["git", "-C", str(repo_dir), "push", "-u", "origin", branch], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "-c", f"credential.helper={credential_helper}", "push", "-u", "origin", branch],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=push_env,
+        )
     except subprocess.CalledProcessError as exc:
+        # exc's command/stdout/stderr never contain the token itself (only
+        # the literal string "$GITHUB_TOKEN", resolved by the nested shell
+        # at runtime, not by this process), so this is safe to log as-is.
         log.warning("Git push failed: %s", exc)
         log.warning("Skipping GitHub push and continuing without failing the entire pipeline.")
         return None
