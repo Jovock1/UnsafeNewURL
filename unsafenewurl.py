@@ -830,6 +830,28 @@ def get_api_key():
         raise ValueError("URL_API_KEY environment variable not set")
 
 
+def fetch_url(url, secrets, timeout=120):
+    """GET a URL and raise_for_status(), redacting any of the given secret
+    substrings out of the error message before re-raising.
+
+    These feed URLs embed their API key directly (the APIs don't support
+    sending it via a header instead), and requests' exception messages
+    include the full request URL -- without this, a failed request would
+    write the live API key in cleartext to the pipeline's logs via main()'s
+    generic exception handler.
+    """
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r
+    except requests.exceptions.RequestException as e:
+        message = str(e)
+        for secret in secrets:
+            if secret:
+                message = message.replace(secret, "***REDACTED***")
+        raise RuntimeError(f"Request failed: {message}") from None
+
+
 def fetch_domains():
     log.info("Fetching domains from API")
     APICall = os.getenv('API_CALL', '0')
@@ -852,8 +874,7 @@ def fetch_domains():
 
     latest_archive = find_latest_archive(archives_dir, "domains")
     url = f"{APICall}{URL_API_KEY}{DAILY_UPDATE}"
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
+    r = fetch_url(url, secrets=[URL_API_KEY])
     archive_bytes = r.content
     archive_hash = hash_bytes(archive_bytes)
 
@@ -927,8 +948,7 @@ def fetch_compromised_domains():
 
     latest_archive = find_latest_archive(archives_dir, "compromised")
     url = f"{APICall}{API_KEY2}{MALWARE}"
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
+    r = fetch_url(url, secrets=[API_KEY2])
     archive_bytes = r.content
     archive_hash = hash_bytes(archive_bytes)
 
