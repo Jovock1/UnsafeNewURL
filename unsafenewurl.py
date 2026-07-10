@@ -29,6 +29,12 @@ log = logging.getLogger(__name__)
 # Global env variables
 BATCH_SIZE = 500
 
+# Real feed archives run ~3-6MB (domains) / ~32MB (compromised) uncompressed;
+# this caps decompression at a generous multiple of that so a
+# compromised/spoofed upstream can't OOM the process with a decompression
+# bomb -- a small compressed payload that expands to gigabytes in memory.
+MAX_ARCHIVE_MEMBER_BYTES = 200 * 1024 * 1024
+
 # Set at start of main() to filter files created during this run
 RUN_START = None
 
@@ -852,6 +858,35 @@ def fetch_url(url, secrets, timeout=120):
         raise RuntimeError(f"Request failed: {message}") from None
 
 
+def read_zip_member_text(archive_bytes, max_size=MAX_ARCHIVE_MEMBER_BYTES):
+    """Decompress the first member of a zip archive to text, refusing to
+    buffer more than max_size bytes into memory.
+
+    zipfile.read() has no size cap of its own -- it'll happily decompress an
+    arbitrarily large payload from a tiny compressed file (a "zip bomb").
+    The zip's own declared uncompressed size is just metadata a malicious
+    archive could lie about, so this streams the read in chunks and checks
+    the running total itself rather than trusting that field.
+    """
+    z = zipfile.ZipFile(io.BytesIO(archive_bytes))
+    name = z.namelist()[0]
+    chunks = []
+    total = 0
+    with z.open(name) as member:
+        while True:
+            chunk = member.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_size:
+                raise ValueError(
+                    f"Refusing to decompress '{name}': exceeded {max_size:,} byte limit "
+                    f"(possible decompression bomb from a compromised feed)"
+                )
+            chunks.append(chunk)
+    return b"".join(chunks).decode()
+
+
 def fetch_domains():
     log.info("Fetching domains from API")
     APICall = os.getenv('API_CALL', '0')
@@ -890,8 +925,7 @@ def fetch_domains():
     archive_path.write_bytes(archive_bytes)
     log.info(f"Saved downloaded archive to {archive_path} (hash {archive_hash})")
 
-    z = zipfile.ZipFile(io.BytesIO(archive_bytes))
-    domains = z.read(z.namelist()[0]).decode().splitlines()
+    domains = read_zip_member_text(archive_bytes).splitlines()
     domains = [d.strip().lower() for d in domains if d.strip()]
     log.info(f"Fetched {len(domains):,} domains.")
     return domains
@@ -964,8 +998,7 @@ def fetch_compromised_domains():
     archive_path.write_bytes(archive_bytes)
     log.info(f"Saved downloaded archive to {archive_path} (hash {archive_hash})")
 
-    z = zipfile.ZipFile(io.BytesIO(archive_bytes))
-    domains = z.read(z.namelist()[0]).decode().splitlines()
+    domains = read_zip_member_text(archive_bytes).splitlines()
     domains = [d.strip().lower() for d in domains if d.strip()]
     log.info(f"Fetched {len(domains):,} domains.")
     return domains
