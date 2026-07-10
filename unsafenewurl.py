@@ -412,6 +412,19 @@ def logs_subdir(name):
     return subdir
 
 
+def sanitize_csv_field(value):
+    """Defuse CSV/formula injection (OWASP-style): prefix values that a
+    spreadsheet app (Excel, Sheets) would interpret as a formula with a
+    leading single quote. The "domain" column is already restricted to
+    [a-z0-9-.] by is_valid_domain() and never needs this, but "category"
+    text comes straight from the LLM's response with no character
+    restrictions, so it gets sanitized here at the point of CSV output only
+    -- the JSON logs keep the raw, unmodified value."""
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def write_daily_log(flagged):
     now = datetime.now()
 
@@ -433,7 +446,11 @@ def write_daily_log(flagged):
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=["domain", "classification"])
         writer.writeheader()
-        writer.writerows(parsed_entries)
+        for entry in parsed_entries:
+            writer.writerow({
+                "domain": entry["domain"],
+                "classification": sanitize_csv_field(entry["classification"]),
+            })
 
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(parsed_entries, handle, indent=2)
@@ -458,7 +475,8 @@ def write_category_summary(flagged):
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=["category", "count"])
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({"category": sanitize_csv_field(row["category"]), "count": row["count"]})
         writer.writerow({"category": "TOTAL", "count": total})
 
     with json_path.open("w", encoding="utf-8") as handle:
