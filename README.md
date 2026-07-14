@@ -9,6 +9,10 @@ What is NRDGuard the TL;DR:
   
   DISCLAMIER: The list is about 24 hours behind once a domain is created.
 
+  DISCLAIMER: This list is provided on a best-effort basis. Domain classification is performed by AI and we do
+  not guarantee that all malicious, scam, or otherwise unwanted domains are caught, nor that every domain on
+  the list is correctly categorized. Use this blocklist as one layer of protection, not a sole safeguard.
+
 The Details:
  
   The agent, downloads 2 lists. The first list is a list of confirmed websites known for malware. These get added to the blocklist.txt, no questions asked.
