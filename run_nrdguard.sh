@@ -20,4 +20,4 @@ if ! flock -n "$lock_fd"; then
     exit 0
 fi
 
-"$REPO_DIR/.venv/bin/python3" "$REPO_DIR/nrdguard.py" >>"$LOG_FILE" 2>&1
+"$REPO_DIR/.venv/bin/python3" "$REPO_DIR/nrdguard.py" "$@" >>"$LOG_FILE" 2>&1
